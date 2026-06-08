@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0   # need full tag history to find the latest release
 
@@ -142,42 +142,44 @@ jobs:
         run: syft oci-archive:image.tar -o spdx-json=sbom.spdx.json
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: sbom-${{ github.sha }}
           path: sbom.spdx.json
 
-      # --registry-referrers-mode oci-1-1 attaches the signature via the OCI 1.1
-      # Referrers API (GHCR supports it) instead of minting a separate
-      # "sha256-….sig" tag — it becomes a reference hanging off the image rather
-      # than clutter in the tag list. (The SBOM and provenance attestations
-      # below use GitHub's attestation actions, which also write referrers.)
+      # cosign signs/attests straight to GHCR, so these work even while the repo
+      # is private (unlike GitHub's attestation API, which needs a public repo
+      # or a paid plan). --new-bundle-format stores both as OCI 1.1 referrers
+      # rather than separate "sha256-….sig"/".att" tags, keeping the tag list
+      # clean. Verify with `cosign verify` / `cosign verify-attestation`.
       - name: Sign image (keyless)
         env:
           DOCKER_CONFIG: ${{ github.workspace }}
-          COSIGN_EXPERIMENTAL: "1"   # required for --registry-referrers-mode oci-1-1
         run: |
           cp "$AUTH_FILE" "$DOCKER_CONFIG/config.json"
           cosign sign --yes \
-            --registry-referrers-mode oci-1-1 \
+            --new-bundle-format \
             "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
 
-      # Signed SBOM attestation (what's inside the image). Pushed to GHCR as an
-      # OCI 1.1 referrer. Uses GitHub's action rather than `cosign attest`
-      # because cosign's attest subcommand lacks the referrers-mode flag.
-      - name: Attest SBOM
-        uses: actions/attest-sbom@v2
-        with:
-          subject-name: ${{ steps.tags.outputs.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          sbom-path: sbom.spdx.json
-          push-to-registry: true
+      # SBOM attestation (what's inside the image), via cosign for the same
+      # private-repo reason as the signature above.
+      - name: Attach SBOM attestation
+        env:
+          DOCKER_CONFIG: ${{ github.workspace }}
+        run: |
+          cosign attest --yes \
+            --new-bundle-format \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
 
       # Signed SLSA build provenance: attests *how* the image was built (this
-      # workflow, commit, runner) as a complement to the SBOM's *what's inside*.
-      # GitHub pushes it to GHCR as an OCI 1.1 referrer, alongside the cosign
-      # signature and SBOM.
+      # workflow, commit, runner). GitHub's attestation API requires the repo to
+      # be public (or a paid plan), so this is skipped while private and starts
+      # running automatically once the repo is made public. Verify the result
+      # with `gh attestation verify`.
       - name: Attest build provenance
+        if: ${{ github.event.repository.private == false }}
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ steps.tags.outputs.image }}
