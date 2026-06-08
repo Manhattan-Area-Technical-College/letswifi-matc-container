@@ -23,7 +23,7 @@ Instead of relying on install scripts that target specific platforms, this proje
 
 ## AI Policy
 
-We are still in the early days, but over the last 6 months it has become clear the tools are acceptable if watched carefully. If anyone else contributes they can be used, just review and know what your adding does. I used it to help organize some of the documentation and help with where my PHP skills were weak and especially the crl generation script. I also tend to let it review all my commits helps me catch my human errors. 
+We are still in the early days, but over the last 6 months it has become clear the tools are acceptable if watched carefully. If anyone else contributes they can be used, just review and know what your adding does. I used it to help organize some of the documentation and help with where my PHP skills were weak and especially the crl generation script.Also I have never used Github actions before so it was vital in getting that done quickly, I also tend to let it review all my commits helps me catch my human errors. 
 
 ## Licensing
 
