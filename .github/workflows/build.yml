@@ -21,7 +21,7 @@ jobs:
   build:
     # Pinned (not "ubuntu-latest"): we need podman >= 4.8 for Containerfile
     # heredoc (RUN <<EOF) support, which 24.04's repo podman provides.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
