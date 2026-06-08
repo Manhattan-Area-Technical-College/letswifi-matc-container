@@ -19,8 +19,10 @@ env:
 
 jobs:
   build:
-    # Pinned (not "ubuntu-latest"): we need podman >= 4.8 for Containerfile
-    # heredoc (RUN <<EOF) support, which 24.04's repo podman provides.
+    # The image is built with buildah *inside* a quay.io/buildah/stable
+    # container (see the build step), so the host's own buildah version is
+    # irrelevant. We only need Docker, which is preinstalled on the runner, to
+    # launch that container.
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -45,11 +47,6 @@ jobs:
           fi
           git checkout "$latest_tag"
           echo "REBUILD_REF=$latest_tag" >> "$GITHUB_ENV"
-
-      - name: Install podman
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y podman
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -92,24 +89,45 @@ jobs:
           echo "primary=${arr[0]}" >> "$GITHUB_OUTPUT"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
-      - name: Build image
+      # Build with buildah inside quay.io/buildah/stable so we always get a
+      # current buildah (the Containerfile uses heredoc "RUN <<EOF" steps that
+      # older buildah versions can't parse). It's launched via Docker, which is
+      # preinstalled on the runner. The container logs into GHCR, pushes every
+      # tag, and exports the image as an OCI archive (for the SBOM step) plus
+      # the pushed digest (for signing) into the workspace.
+      - name: Build and push image
+        id: build
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          PRIMARY: ${{ steps.tags.outputs.primary }}
+          ALL_TAGS: ${{ steps.tags.outputs.tags }}
         run: |
-          podman build \
-            --file Containerfile \
-            --tag "${{ steps.tags.outputs.primary }}" \
-            .
-
-      - name: Apply additional tags
-        run: |
-          read -ra arr <<< "${{ steps.tags.outputs.tags }}"
-          for t in "${arr[@]:1}"; do
-            podman tag "${{ steps.tags.outputs.primary }}" "$t"
-          done
+          docker run --rm --privileged \
+            -e REGISTRY="$REGISTRY" \
+            -e REGISTRY_USER \
+            -e REGISTRY_PASSWORD \
+            -e PRIMARY \
+            -e ALL_TAGS \
+            -v "$GITHUB_WORKSPACE":/work -w /work \
+            quay.io/buildah/stable:latest \
+            bash -euxo pipefail -c '
+              echo "$REGISTRY_PASSWORD" | buildah login -u "$REGISTRY_USER" --password-stdin "$REGISTRY"
+              buildah bud --format oci -t "$PRIMARY" -f Containerfile .
+              read -ra tags <<< "$ALL_TAGS"
+              for t in "${tags[@]:1}"; do
+                buildah tag "$PRIMARY" "$t"
+              done
+              buildah push --digestfile /work/digest.txt "$PRIMARY"
+              for t in "${tags[@]:1}"; do
+                buildah push "$t"
+              done
+              buildah push "$PRIMARY" oci-archive:/work/image.tar
+            '
+          echo "digest=$(cat "$GITHUB_WORKSPACE/digest.txt")" >> "$GITHUB_OUTPUT"
 
       - name: Generate SBOM
-        run: |
-          podman save --format oci-archive -o image.tar "${{ steps.tags.outputs.primary }}"
-          syft oci-archive:image.tar -o spdx-json="sbom.spdx.json"
+        run: syft oci-archive:image.tar -o spdx-json=sbom.spdx.json
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
@@ -117,25 +135,13 @@ jobs:
           name: sbom-${{ github.sha }}
           path: sbom.spdx.json
 
-      - name: Push image
-        id: push
-        run: |
-          read -ra arr <<< "${{ steps.tags.outputs.tags }}"
-          podman push --authfile "$AUTH_FILE" \
-            --digestfile digest.txt \
-            "${arr[0]}"
-          for t in "${arr[@]:1}"; do
-            podman push --authfile "$AUTH_FILE" "$t"
-          done
-          echo "digest=$(cat digest.txt)" >> "$GITHUB_OUTPUT"
-
       - name: Sign image (keyless)
         env:
           DOCKER_CONFIG: ${{ github.workspace }}
         run: |
           cp "$AUTH_FILE" "$DOCKER_CONFIG/config.json"
           cosign sign --yes \
-            "${{ steps.tags.outputs.image }}@${{ steps.push.outputs.digest }}"
+            "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
 
       - name: Attach SBOM attestation
         env:
@@ -144,4 +150,4 @@ jobs:
           cosign attest --yes \
             --predicate sbom.spdx.json \
             --type spdxjson \
-            "${{ steps.tags.outputs.image }}@${{ steps.push.outputs.digest }}"
+            "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
