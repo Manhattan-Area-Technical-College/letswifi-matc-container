@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh letswifi CRL every 6 hours
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=6h
+AccuracySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,49 @@
+[Unit]
+Description=LetsWifi Eduroam Portal
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/letswifi:latest
+
+# ── Networking ───────────────────────────────────────────────────────────────
+# Default: plain HTTP, TLS terminates at your reverse proxy (nginx, Caddy, etc.)
+PublishPort=8080:80
+# To terminate TLS inside the container instead, comment out the line above,
+# uncomment the line below, and place cert/key at:
+#   /etc/pki/tls/certs/letswifi.crt  and  /etc/pki/tls/private/letswifi.key
+# entrypoint.sh enables the HTTPS vhost automatically when the cert is present.
+# PublishPort=8443:443
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# Created via: podman secret create <name> - <<< "value"
+# Injected as environment variables inside the container.
+Secret=ssp_secret_salt,type=env,target=SSP_SECRET_SALT
+Secret=ssp_admin_password,type=env,target=SSP_ADMIN_PASSWORD
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# Copy letswifi.env.example to /etc/sysconfig/letswifi, fill in your values.
+# All documented variables live in that file.
+EnvironmentFile=/etc/sysconfig/letswifi
+
+# ── Persistent storage ───────────────────────────────────────────────────────
+# SQLite database and issued certificates
+Volume=letswifi-data:/var/lib/letswifi:Z
+# LetsWifi application config (generated on first run, then yours to edit)
+Volume=letswifi-config:/etc/letswifi:Z
+# SimpleSAMLphp config and federation metadata
+Volume=letswifi-ssp:/etc/simplesamlphp:Z
+
+# We have Apache and php-fpm running so the container needs systemd
+PodmanArgs=--systemd=always
+
+# Stop gracefully — let systemd inside shut down httpd/php-fpm
+StopTimeout=30
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=90
+
+[Install]
+WantedBy=default.target
