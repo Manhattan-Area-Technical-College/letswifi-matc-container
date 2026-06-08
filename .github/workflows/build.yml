@@ -147,10 +147,11 @@ jobs:
           name: sbom-${{ github.sha }}
           path: sbom.spdx.json
 
-      # --registry-referrers-mode oci-1-1 attaches the signature and attestation
-      # via the OCI 1.1 Referrers API (GHCR supports it) instead of minting
-      # separate "sha256-….sig" / ".att" tags. They become references hanging
-      # off the image rather than clutter in the tag list.
+      # --registry-referrers-mode oci-1-1 attaches the signature via the OCI 1.1
+      # Referrers API (GHCR supports it) instead of minting a separate
+      # "sha256-….sig" tag — it becomes a reference hanging off the image rather
+      # than clutter in the tag list. (The SBOM and provenance attestations
+      # below use GitHub's attestation actions, which also write referrers.)
       - name: Sign image (keyless)
         env:
           DOCKER_CONFIG: ${{ github.workspace }}
@@ -161,16 +162,16 @@ jobs:
             --registry-referrers-mode oci-1-1 \
             "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
 
-      - name: Attach SBOM attestation
-        env:
-          DOCKER_CONFIG: ${{ github.workspace }}
-          COSIGN_EXPERIMENTAL: "1"   # required for --registry-referrers-mode oci-1-1
-        run: |
-          cosign attest --yes \
-            --registry-referrers-mode oci-1-1 \
-            --predicate sbom.spdx.json \
-            --type spdxjson \
-            "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
+      # Signed SBOM attestation (what's inside the image). Pushed to GHCR as an
+      # OCI 1.1 referrer. Uses GitHub's action rather than `cosign attest`
+      # because cosign's attest subcommand lacks the referrers-mode flag.
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
 
       # Signed SLSA build provenance: attests *how* the image was built (this
       # workflow, commit, runner) as a complement to the SBOM's *what's inside*.
