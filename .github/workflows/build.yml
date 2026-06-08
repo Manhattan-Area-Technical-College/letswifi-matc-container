@@ -147,39 +147,52 @@ jobs:
           name: sbom-${{ github.sha }}
           path: sbom.spdx.json
 
-      # cosign signs/attests straight to GHCR, so these work even while the repo
-      # is private (unlike GitHub's attestation API, which needs a public repo
-      # or a paid plan). --new-bundle-format stores both as OCI 1.1 referrers
-      # rather than separate "sha256-….sig"/".att" tags, keeping the tag list
-      # clean. Verify with `cosign verify` / `cosign verify-attestation`.
+      # Detect repo visibility at runtime. Signing and the SBOM/provenance
+      # attestations below only run once the repo is public, so they turn on
+      # automatically when you flip visibility — on any trigger, including
+      # scheduled runs (where github.event.repository.private is empty). While
+      # private, the build still publishes the image and keeps the SBOM as a
+      # workflow artifact (above).
+      - name: Check repository visibility
+        id: vis
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          visibility=$(gh repo view "$GITHUB_REPOSITORY" --json visibility -q .visibility)
+          echo "Repository is $visibility."
+          [[ "$visibility" == "public" ]] && public=true || public=false
+          echo "public=$public" >> "$GITHUB_OUTPUT"
+
+      # Keyless signature, attached as an OCI 1.1 referrer instead of a
+      # "sha256-….sig" tag (referrers mode is still experimental in cosign,
+      # hence COSIGN_EXPERIMENTAL). Verify with `cosign verify`.
       - name: Sign image (keyless)
+        if: ${{ steps.vis.outputs.public == 'true' }}
         env:
           DOCKER_CONFIG: ${{ github.workspace }}
+          COSIGN_EXPERIMENTAL: "1"
         run: |
           cp "$AUTH_FILE" "$DOCKER_CONFIG/config.json"
           cosign sign --yes \
-            --new-bundle-format \
+            --registry-referrers-mode oci-1-1 \
             "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
 
-      # SBOM attestation (what's inside the image), via cosign for the same
-      # private-repo reason as the signature above.
-      - name: Attach SBOM attestation
-        env:
-          DOCKER_CONFIG: ${{ github.workspace }}
-        run: |
-          cosign attest --yes \
-            --new-bundle-format \
-            --predicate sbom.spdx.json \
-            --type spdxjson \
-            "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
+      # SBOM attestation (what's inside the image), via GitHub's action so it
+      # lands as a clean OCI 1.1 referrer and in the repo's Attestations UI.
+      # Verify with `gh attestation verify`.
+      - name: Attest SBOM
+        if: ${{ steps.vis.outputs.public == 'true' }}
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
 
       # Signed SLSA build provenance: attests *how* the image was built (this
-      # workflow, commit, runner). GitHub's attestation API requires the repo to
-      # be public (or a paid plan), so this is skipped while private and starts
-      # running automatically once the repo is made public. Verify the result
-      # with `gh attestation verify`.
+      # workflow, commit, runner). Verify with `gh attestation verify`.
       - name: Attest build provenance
-        if: ${{ github.event.repository.private == false }}
+        if: ${{ steps.vis.outputs.public == 'true' }}
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ steps.tags.outputs.image }}
