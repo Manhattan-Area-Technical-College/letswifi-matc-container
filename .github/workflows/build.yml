@@ -154,6 +154,7 @@ jobs:
       - name: Sign image (keyless)
         env:
           DOCKER_CONFIG: ${{ github.workspace }}
+          COSIGN_EXPERIMENTAL: "1"   # required for --registry-referrers-mode oci-1-1
         run: |
           cp "$AUTH_FILE" "$DOCKER_CONFIG/config.json"
           cosign sign --yes \
@@ -163,6 +164,7 @@ jobs:
       - name: Attach SBOM attestation
         env:
           DOCKER_CONFIG: ${{ github.workspace }}
+          COSIGN_EXPERIMENTAL: "1"   # required for --registry-referrers-mode oci-1-1
         run: |
           cosign attest --yes \
             --registry-referrers-mode oci-1-1 \
