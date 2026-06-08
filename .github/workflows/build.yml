@@ -27,7 +27,8 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write   # required for cosign keyless (OIDC) signing
+      id-token: write      # required for cosign keyless (OIDC) signing
+      attestations: write  # required for actions/attest-build-provenance
 
     steps:
       - name: Checkout
@@ -80,14 +81,17 @@ jobs:
             minor="${BASH_REMATCH[2]}"
             patch="${BASH_REMATCH[3]}"
             tags="$image:v${major}.${minor}.${patch} $image:v${major}.${minor} $image:v${major} $image:latest"
+            version="v${major}.${minor}.${patch}"
           else
             short_sha="${GITHUB_SHA::7}"
             tags="$image:edge $image:$short_sha"
+            version="$short_sha"
           fi
 
           read -ra arr <<< "$tags"
           echo "primary=${arr[0]}" >> "$GITHUB_OUTPUT"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # Build with buildah inside quay.io/buildah/stable so we always get a
       # current buildah (the Containerfile uses heredoc "RUN <<EOF" steps that
@@ -102,6 +106,8 @@ jobs:
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
           PRIMARY: ${{ steps.tags.outputs.primary }}
           ALL_TAGS: ${{ steps.tags.outputs.tags }}
+          REVISION: ${{ github.sha }}
+          VERSION: ${{ steps.tags.outputs.version }}
         run: |
           docker run --rm --privileged \
             -e REGISTRY="$REGISTRY" \
@@ -109,11 +115,17 @@ jobs:
             -e REGISTRY_PASSWORD \
             -e PRIMARY \
             -e ALL_TAGS \
+            -e REVISION \
+            -e VERSION \
             -v "$GITHUB_WORKSPACE":/work -w /work \
             quay.io/buildah/stable:latest \
             bash -euxo pipefail -c '
               echo "$REGISTRY_PASSWORD" | buildah login -u "$REGISTRY_USER" --password-stdin "$REGISTRY"
-              buildah bud --format oci -t "$PRIMARY" -f Containerfile .
+              buildah bud --format oci \
+                --label org.opencontainers.image.created="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --label org.opencontainers.image.revision="$REVISION" \
+                --label org.opencontainers.image.version="$VERSION" \
+                -t "$PRIMARY" -f Containerfile .
               read -ra tags <<< "$ALL_TAGS"
               for t in "${tags[@]:1}"; do
                 buildah tag "$PRIMARY" "$t"
@@ -135,12 +147,17 @@ jobs:
           name: sbom-${{ github.sha }}
           path: sbom.spdx.json
 
+      # --registry-referrers-mode oci-1-1 attaches the signature and attestation
+      # via the OCI 1.1 Referrers API (GHCR supports it) instead of minting
+      # separate "sha256-….sig" / ".att" tags. They become references hanging
+      # off the image rather than clutter in the tag list.
       - name: Sign image (keyless)
         env:
           DOCKER_CONFIG: ${{ github.workspace }}
         run: |
           cp "$AUTH_FILE" "$DOCKER_CONFIG/config.json"
           cosign sign --yes \
+            --registry-referrers-mode oci-1-1 \
             "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
 
       - name: Attach SBOM attestation
@@ -148,6 +165,18 @@ jobs:
           DOCKER_CONFIG: ${{ github.workspace }}
         run: |
           cosign attest --yes \
+            --registry-referrers-mode oci-1-1 \
             --predicate sbom.spdx.json \
             --type spdxjson \
             "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
+
+      # Signed SLSA build provenance: attests *how* the image was built (this
+      # workflow, commit, runner) as a complement to the SBOM's *what's inside*.
+      # GitHub pushes it to GHCR as an OCI 1.1 referrer, alongside the cosign
+      # signature and SBOM.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
