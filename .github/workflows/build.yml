@@ -1,0 +1,145 @@
+name: Build and publish container image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  schedule:
+    # Weekly: rebuild the latest release against the current UBI base image so
+    # Red Hat's CVE patches land in our published tags without us having to
+    # bump our own version. If UBI hasn't changed, the rebuild reuses the same
+    # layers and the push is effectively a no-op.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  AUTH_FILE: ${{ github.workspace }}/.docker-config.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # required for cosign keyless (OIDC) signing
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full tag history to find the latest release
+
+      # Scheduled runs aren't tied to a tag push, so resolve and check out the
+      # most recent vX.Y.Z release ourselves before building from it.
+      - name: Resolve latest release for scheduled rebuild
+        if: github.event_name == 'schedule'
+        run: |
+          latest_tag=$(git tag -l 'v*.*.*' | sort -V | tail -n1)
+          if [[ -z "$latest_tag" ]]; then
+            echo "No vX.Y.Z release tags exist yet; nothing to rebuild." >&2
+            exit 1
+          fi
+          git checkout "$latest_tag"
+          echo "REBUILD_REF=$latest_tag" >> "$GITHUB_ENV"
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Write registry credentials
+        run: |
+          auth=$(printf '%s:%s' "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 -w0)
+          printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$auth" > "$AUTH_FILE"
+
+      # Tagged pushes (vX.Y.Z) — and scheduled rebuilds of the latest release —
+      # publish the stable, version-pinned tags that other people should build
+      # on. Anything else (branch pushes, manual runs) publishes only "edge" +
+      # short-sha so "latest" stays meaningful.
+      - name: Set image tags
+        id: tags
+        run: |
+          image="$REGISTRY/${IMAGE_NAME,,}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            release_ref="$REBUILD_REF"
+          elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            release_ref="$GITHUB_REF_NAME"
+          fi
+
+          if [[ "$release_ref" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            patch="${BASH_REMATCH[3]}"
+            tags="$image:v${major}.${minor}.${patch} $image:v${major}.${minor} $image:v${major} $image:latest"
+          else
+            short_sha="${GITHUB_SHA::7}"
+            tags="$image:edge $image:$short_sha"
+          fi
+
+          read -ra arr <<< "$tags"
+          echo "primary=${arr[0]}" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: |
+          podman build \
+            --file Containerfile \
+            --tag "${{ steps.tags.outputs.primary }}" \
+            .
+
+      - name: Apply additional tags
+        run: |
+          read -ra arr <<< "${{ steps.tags.outputs.tags }}"
+          for t in "${arr[@]:1}"; do
+            podman tag "${{ steps.tags.outputs.primary }}" "$t"
+          done
+
+      - name: Generate SBOM
+        run: |
+          podman save --format oci-archive -o image.tar "${{ steps.tags.outputs.primary }}"
+          syft oci-archive:image.tar -o spdx-json="sbom.spdx.json"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.spdx.json
+
+      - name: Push image
+        id: push
+        run: |
+          read -ra arr <<< "${{ steps.tags.outputs.tags }}"
+          podman push --authfile "$AUTH_FILE" \
+            --digestfile digest.txt \
+            "${arr[0]}"
+          for t in "${arr[@]:1}"; do
+            podman push --authfile "$AUTH_FILE" "$t"
+          done
+          echo "digest=$(cat digest.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Sign image (keyless)
+        env:
+          DOCKER_CONFIG: ${{ github.workspace }}
+        run: |
+          cp "$AUTH_FILE" "$DOCKER_CONFIG/config.json"
+          cosign sign --yes \
+            "${{ steps.tags.outputs.image }}@${{ steps.push.outputs.digest }}"
+
+      - name: Attach SBOM attestation
+        env:
+          DOCKER_CONFIG: ${{ github.workspace }}
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${{ steps.tags.outputs.image }}@${{ steps.push.outputs.digest }}"
