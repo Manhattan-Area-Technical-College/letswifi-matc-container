@@ -61,8 +61,41 @@ esac
         -e "s@^\(\s*'password'\).*\$@\1 => null,@" \
         /etc/letswifi/database.conf.dist-sqlite.php > /etc/letswifi/database.conf.php
 
-    # Admin users: comma-separated user IDs or eduPersonAffiliation values.
-    # Checked against the SAML-authenticated user's ID and affiliations at login.
+    # The provider block (admins, userIdAttribute, affiliationAttribute, grant-token
+    # validity, the realm mapping and the IdP pin) is no longer patched inline here.
+    # It is broken out into its own provider.conf.php and generated from env in the
+    # "Provider config" section below, so it is a single regenerable artifact.
+
+    head -c32 /dev/random | base64 | tr -d = > /etc/letswifi/oauthsecret.txt
+
+    rm -f /etc/letswifi/*.dist* /etc/letswifi/*.dev* /etc/letswifi/README.md
+    rm -f /etc/letswifi/realms/*.conf.php /etc/letswifi/certs/*.pem
+    chgrp -R apache /etc/letswifi
+    chmod o-rwx /etc/letswifi/*
+    echo "letswifi: letswifi config initialised"
+fi
+
+# ── Provider config (first run / regenerable) ────────────────────────────────
+# Upstream ships the provider block inline in letswifi.conf.php, pointed at the
+# example.com realm that the first-run cleanup above deletes.  We instead break
+# it out into its own provider.conf.php (referenced via 'provider#inc') and
+# generate it from env, reusing the realm/admin/attribute vars.  This wires the
+# portal to our real realm and IdP, and makes the provider a disposable artifact:
+# delete /etc/letswifi/provider.conf.php and restart to re-apply env changes.
+if [ -n "${LETSWIFI_REALM:-}" ] && [ ! -f /etc/letswifi/provider.conf.php ]; then
+    echo "letswifi: writing provider config for realm ${LETSWIFI_REALM}"
+
+    # Display name: explicit override → product name → realm display name → realm.
+    _provider_display="$(php_escape "${LETSWIFI_PROVIDER_DISPLAY_NAME:-${LETSWIFI_PRODUCT_NAME:-${LETSWIFI_REALM_DISPLAY_NAME:-$LETSWIFI_REALM}}}")"
+    _provider_desc="$(php_escape "Wi-Fi enrollment for ${LETSWIFI_REALM}")"
+    _provider_realm="$(php_escape "$LETSWIFI_REALM")"
+
+    # Contact: reuse the realm contact; omit (null) when unset.
+    _contact_php="null"
+    [ -n "${LETSWIFI_REALM_CONTACT:-}" ] && _contact_php="'$(php_escape "$LETSWIFI_REALM_CONTACT")'"
+
+    # Admins: comma-separated user IDs or eduPersonAffiliation values, each checked
+    # against the SAML-authenticated user's ID and affiliations at login.
     _admins_php=""
     if [ -n "${LETSWIFI_ADMIN_USERS:-}" ]; then
         _old_ifs="$IFS"; IFS=','
@@ -80,47 +113,96 @@ esac
         done
         IFS="$_old_ifs"
     fi
-    awk -v admins="$_admins_php" '
-        /'"'"'admins'"'"' *=> *\[/ {
-            printf "    '"'"'admins'"'"' => [%s],\n", admins
-            in_block = 1; next
-        }
-        in_block && /^[[:space:]]*\],?[[:space:]]*$/ { in_block = 0; next }
-        in_block { next }
-        { print }
-    ' /etc/letswifi/letswifi.conf.php > /tmp/lw-conf.tmp \
-        && mv /tmp/lw-conf.tmp /etc/letswifi/letswifi.conf.php
 
-    # User identity attribute: which SAML/OIDC attribute to use as the user identity
-    # embedded in each issued device cert.  null = SSP NameID (typically UPN from Entra).
-    if [ -n "${LETSWIFI_USER_ID_ATTRIBUTE:-}" ]; then
-        _uid_escaped="$(php_escape "$LETSWIFI_USER_ID_ATTRIBUTE")"
-        sed -i "s/'userIdAttribute' *=> *null/'userIdAttribute' => '${_uid_escaped}'/" \
-            /etc/letswifi/letswifi.conf.php
+    # User identity attribute embedded in each issued device cert. null = SSP NameID.
+    _uid_php="null"
+    [ -n "${LETSWIFI_USER_ID_ATTRIBUTE:-}" ] && _uid_php="'$(php_escape "$LETSWIFI_USER_ID_ATTRIBUTE")'"
+
+    # Affiliation attribute carrying the user's affiliations (realm + admin scope).
+    _affiliation="$(php_escape "${LETSWIFI_AFFILIATION_ATTRIBUTE:-eduPersonAffiliation}")"
+
+    # SAML IdP pin: populates both samlIdp and idpList from the same entity ID.
+    # Setting idpList to a single IdP also skips the SimpleSAMLphp IdP-picker screen.
+    _samlidp_php="null"
+    _idplist_php=""
+    if [ -n "${LETSWIFI_SAML_IDP_ENTITYID:-}" ]; then
+        _idp_escaped="$(php_escape "$LETSWIFI_SAML_IDP_ENTITYID")"
+        _samlidp_php="'${_idp_escaped}'"
+        _idplist_php="'${_idp_escaped}'"
     fi
 
-    # Affiliation attribute: which SAML/OIDC attribute carries the user's affiliations.
-    # Used for realm assignment and admin scope checks.  Default: eduPersonAffiliation.
-    if [ -n "${LETSWIFI_AFFILIATION_ATTRIBUTE:-}" ]; then
-        _aff_escaped="$(php_escape "$LETSWIFI_AFFILIATION_ATTRIBUTE")"
-        sed -i "s/'affiliationAttribute' *=> *'[^']*'/'affiliationAttribute' => '${_aff_escaped}'/" \
-            /etc/letswifi/letswifi.conf.php
-    fi
-
-    # Grant token validity: how many days a portal login grant stays valid before the
-    # user must re-authenticate to enroll additional devices.  Default: 180 (upstream).
+    # Grant token validity (days): how long a portal login grant stays valid for
+    # enrolling more devices. Omitted = upstream default (6 months). Must be numeric.
+    _grant_line=""
     if [ -n "${LETSWIFI_GRANT_TOKEN_VALIDITY:-}" ]; then
-        sed -i "s/'longLivedGrantTokenValidity' *=> *[0-9]*/'longLivedGrantTokenValidity' => ${LETSWIFI_GRANT_TOKEN_VALIDITY}/" \
-            /etc/letswifi/letswifi.conf.php
+        case "$LETSWIFI_GRANT_TOKEN_VALIDITY" in
+            ''|*[!0-9]*)
+                echo "letswifi: ERROR: LETSWIFI_GRANT_TOKEN_VALIDITY must be a whole number of days." >&2
+                exit 1
+                ;;
+        esac
+        _grant_line="            'longLivedGrantTokenValidity' => ${LETSWIFI_GRANT_TOKEN_VALIDITY},"
     fi
 
-    head -c32 /dev/random | base64 | tr -d = > /etc/letswifi/oauthsecret.txt
+    {
+        cat <<PHPEOF
+<?php return [
+    '_default' => [
+        'display_name' => ['en-GB' => '${_provider_display}'],
+        'description'  => ['en-GB' => '${_provider_desc}'],
+        'realm'        => ['' => ['${_provider_realm}']],
+        'contact'      => ${_contact_php},
+        'admins'       => [${_admins_php}],
+        'auth' => [
+            'service' => 'SimpleSamlAuth',
+            'param' => [
+                'autoloadInclude'      => '/usr/local/share/simplesamlphp/lib/_autoload.php',
+                'authSource'           => 'default-sp',
+                'userIdAttribute'      => ${_uid_php},
+                'affiliationAttribute' => '${_affiliation}',
+                'samlIdp'              => ${_samlidp_php},
+                'idpList'              => [${_idplist_php}],
+                'verifyAuthenticatingAuthority' => true,
+            ],
+PHPEOF
+        [ -n "$_grant_line" ] && printf '%s\n' "$_grant_line"
+        cat <<'PHPEOF'
+        ],
+        'location' => [],
+        'logo'     => null,
 
-    rm -f /etc/letswifi/*.dist* /etc/letswifi/*.dev* /etc/letswifi/README.md
-    rm -f /etc/letswifi/realms/*.conf.php /etc/letswifi/certs/*.pem
-    chgrp -R apache /etc/letswifi
-    chmod o-rwx /etc/letswifi/*
-    echo "letswifi: letswifi config initialised"
+        // Sibling config files already provisioned in /etc/letswifi by first run.
+        'pdo#inc'          => 'database.conf.php',
+        'clients#inc'      => 'clients.conf.php',
+        'oauthsecret#file' => 'oauthsecret.txt',
+    ],
+];
+PHPEOF
+    } > /etc/letswifi/provider.conf.php
+
+    # Point letswifi.conf.php at the generated file instead of its inline provider
+    # block. The inline 'provider' key takes priority over 'provider#inc', so the
+    # whole block must be removed. Idempotent: only rewrites when the inline block
+    # is still present (a fresh config, or an image upgrade over an old one).
+    if ! grep -q "'provider#inc'" /etc/letswifi/letswifi.conf.php; then
+        awk '
+            skip && /^\t\][,]?$/ { skip = 0; next }
+            skip { next }
+            /^\t'\''provider'\'' => \[$/ {
+                print "\t'\''provider#inc'\'' => '\''provider.conf.php'\'',"
+                skip = 1
+                next
+            }
+            { print }
+        ' /etc/letswifi/letswifi.conf.php > /tmp/lw-conf.tmp \
+            && mv /tmp/lw-conf.tmp /etc/letswifi/letswifi.conf.php
+        chgrp apache /etc/letswifi/letswifi.conf.php
+        chmod o-rwx /etc/letswifi/letswifi.conf.php
+    fi
+
+    chgrp apache /etc/letswifi/provider.conf.php
+    chmod o-rwx /etc/letswifi/provider.conf.php
+    echo "letswifi: provider config written (provider#inc → provider.conf.php)"
 fi
 
 # ── SimpleSAMLphp config (first run only) ────────────────────────────────────
@@ -160,6 +242,35 @@ EOF
 
     chown -R apache:apache /etc/simplesamlphp/metadata
     echo "letswifi: SimpleSAMLphp config initialised"
+fi
+
+# ── SimpleSAMLphp SP authsource (first run / regenerable) ────────────────────
+# The provider authenticates against the 'default-sp' authsource.  SSP ships only
+# an example authsources.php.dist (no authsources.php), so without this the
+# provider's samlIdp references a SP/IdP that SSP doesn't know and login fails.
+# Seed it from the example, point the SP entityID at this deployment, and pin the
+# IdP when LETSWIFI_SAML_IDP_ENTITYID is set (else SSP shows the IdP picker).
+# Regenerable: delete /etc/simplesamlphp/authsources.php and restart to re-apply.
+# A user-provided authsources.php is left untouched.
+#
+# RELATED WORK / GOTCHA: the SP entityID (https://${LETSWIFI_FQDN}) must be
+# registered at your IdP (e.g. Microsoft Entra) with the matching ACS URL
+# (https://${LETSWIFI_FQDN}/simplesaml/module.php/saml/sp/saml2-acs.php/default-sp),
+# and the IdP's metadata must be available to SSP (see SSP_IDP_METADATA_URL above).
+if [ ! -f /etc/simplesamlphp/authsources.php ] && [ -f /etc/simplesamlphp/authsources.php.dist ]; then
+    echo "letswifi: first run — writing SimpleSAMLphp default-sp authsource"
+    cp /etc/simplesamlphp/authsources.php.dist /etc/simplesamlphp/authsources.php
+    sed -i "s@'entityID' => 'https://myapp.example.org/'@'entityID' => 'https://$(sed_escape "$LETSWIFI_FQDN")'@" \
+        /etc/simplesamlphp/authsources.php
+    if [ -n "${LETSWIFI_SAML_IDP_ENTITYID:-}" ]; then
+        sed -i "s@'idp' => null@'idp' => '$(sed_escape "$LETSWIFI_SAML_IDP_ENTITYID")'@" \
+            /etc/simplesamlphp/authsources.php
+        echo "letswifi: default-sp IdP pinned to ${LETSWIFI_SAML_IDP_ENTITYID}"
+    else
+        echo "letswifi: default-sp IdP left unset — SimpleSAMLphp will show the IdP picker"
+    fi
+    chown apache:apache /etc/simplesamlphp/authsources.php
+    echo "letswifi: SimpleSAMLphp authsource written"
 fi
 
 # ── Database schema (first run only) ─────────────────────────────────────────
