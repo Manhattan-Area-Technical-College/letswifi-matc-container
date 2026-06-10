@@ -158,7 +158,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          visibility=$(gh repo view "$GITHUB_REPOSITORY" --json visibility -q .visibility)
+          visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)
           echo "Repository is $visibility."
           [[ "$visibility" == "public" ]] && public=true || public=false
           echo "public=$public" >> "$GITHUB_OUTPUT"
