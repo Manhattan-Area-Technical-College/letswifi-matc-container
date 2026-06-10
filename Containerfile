@@ -44,7 +44,7 @@ FROM registry.access.redhat.com/ubi10/ubi-init:10.0
 
 RUN <<EOF bash
     set -euxo pipefail
-    dnf install -y httpd mod_ssl php php-fpm php-xml php-mbstring php-pdo php-mysqlnd sqlite cronie php-curl
+    dnf install -y httpd mod_ssl php php-fpm php-xml php-mbstring php-pdo php-mysqlnd sqlite cronie php-curl openssl
     dnf clean all
 EOF
 
