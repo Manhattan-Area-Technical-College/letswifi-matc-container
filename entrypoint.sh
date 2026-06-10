@@ -49,6 +49,12 @@ if [ ! -f /etc/letswifi/letswifi.conf.php ]; then
     echo "letswifi: first run — initialising letswifi config"
     cp -a "$APP"/config-dist/. /etc/letswifi/
 
+    #Not documented anywhere fails without.
+case "${LETSWIFI_NETWORK_NAME:-eduroam}" in
+    govroam) cp /etc/letswifi/clients-govroam.conf.php /etc/letswifi/clients.conf.php ;;
+    *)       cp /etc/letswifi/clients-eduroam.conf.php /etc/letswifi/clients.conf.php ;;
+esac
+
     DSN="sqlite:/var/lib/letswifi/letswifi.sqlite"
     sed -e "s@^\(\s*'dsn'\).*\$@\1 => '$(sed_escape "${DSN}")',@" \
         -e "s@^\(\s*'username'\).*\$@\1 => null,@" \
@@ -120,8 +126,7 @@ fi
 # ── SimpleSAMLphp config (first run only) ────────────────────────────────────
 if [ ! -f /etc/simplesamlphp/config.php ]; then
     echo "letswifi: first run — initialising SimpleSAMLphp config"
-    cp -a "$SSP"/config-templates/. /etc/simplesamlphp/ 2>/dev/null \
-        || cp -a "$SSP"/config/. /etc/simplesamlphp/
+    cp -a "$SSP"/config-dist/. /etc/simplesamlphp/
     cp -n /etc/simplesamlphp/config.php.dist /etc/simplesamlphp/config.php
 
     SALT="${SSP_SECRET_SALT:?SSP_SECRET_SALT is required}"
