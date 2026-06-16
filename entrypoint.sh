@@ -235,6 +235,19 @@ if [ ! -f /etc/simplesamlphp/config.php ]; then
     'outputFormat'=> 'flatfile',
 ]]];
 EOF
+        # metarefresh runs as a cron hook, so the cron module has to be enabled
+        # AND configured. Without this, cron.php aborts with "enable the cron
+        # module" and then "Missing configuration file (config/module_cron.php)",
+        # so neither the 04:00 job nor a manual run ever refreshes metadata.
+        echo "\$config['module.enable']['cron'] = true;" >> /etc/simplesamlphp/config.php
+        cat > /etc/simplesamlphp/module_cron.php <<EOF
+<?php
+\$config = [
+    'key'          => '$(head -c32 /dev/random | base64 | tr -d =)',
+    'allowed_tags' => ['daily', 'hourly', 'frequent'],
+    'sendemail'    => false,
+];
+EOF
         echo "0 4 * * * apache php $SSP/modules/cron/bin/cron.php -t daily >/dev/null" \
             > /etc/cron.d/simplesamlphp
         echo "letswifi: IdP metadata refresh configured for ${SSP_IDP_METADATA_URL}"
