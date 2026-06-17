@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh letswifi CRL
+After=network.target
+
+[Service]
+Type=oneshot
+User=apache
+ExecStart=/usr/local/bin/letswifi-gen-crl
+StandardOutput=journal
+StandardError=journal

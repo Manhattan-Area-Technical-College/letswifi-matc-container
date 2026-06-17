@@ -1,0 +1,200 @@
+name: Build and publish container image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  schedule:
+    # Weekly: rebuild the latest release against the current UBI base image so
+    # Red Hat's CVE patches land in our published tags without us having to
+    # bump our own version. If UBI hasn't changed, the rebuild reuses the same
+    # layers and the push is effectively a no-op.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  AUTH_FILE: ${{ github.workspace }}/.docker-config.json
+
+jobs:
+  build:
+    # The image is built with buildah *inside* a quay.io/buildah/stable
+    # container (see the build step), so the host's own buildah version is
+    # irrelevant. We only need Docker, which is preinstalled on the runner, to
+    # launch that container.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # required for cosign keyless (OIDC) signing
+      attestations: write  # required for actions/attest-build-provenance
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # need full tag history to find the latest release
+
+      # Scheduled runs aren't tied to a tag push, so resolve and check out the
+      # most recent vX.Y.Z release ourselves before building from it.
+      - name: Resolve latest release for scheduled rebuild
+        if: github.event_name == 'schedule'
+        run: |
+          latest_tag=$(git tag -l 'v*.*.*' | sort -V | tail -n1)
+          if [[ -z "$latest_tag" ]]; then
+            echo "No vX.Y.Z release tags exist yet; nothing to rebuild." >&2
+            exit 1
+          fi
+          git checkout "$latest_tag"
+          echo "REBUILD_REF=$latest_tag" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Write registry credentials
+        run: |
+          auth=$(printf '%s:%s' "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 -w0)
+          printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$auth" > "$AUTH_FILE"
+
+      # Tagged pushes (vX.Y.Z) — and scheduled rebuilds of the latest release —
+      # publish the stable, version-pinned tags that other people should build
+      # on. Anything else (branch pushes, manual runs) publishes only "edge" +
+      # short-sha so "latest" stays meaningful.
+      - name: Set image tags
+        id: tags
+        run: |
+          image="$REGISTRY/${IMAGE_NAME,,}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            release_ref="$REBUILD_REF"
+          elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            release_ref="$GITHUB_REF_NAME"
+          fi
+
+          if [[ "$release_ref" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            patch="${BASH_REMATCH[3]}"
+            tags="$image:v${major}.${minor}.${patch} $image:v${major}.${minor} $image:v${major} $image:latest"
+            version="v${major}.${minor}.${patch}"
+          else
+            short_sha="${GITHUB_SHA::7}"
+            tags="$image:edge $image:$short_sha"
+            version="$short_sha"
+          fi
+
+          read -ra arr <<< "$tags"
+          echo "primary=${arr[0]}" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Build with buildah inside quay.io/buildah/stable so we always get a
+      # current buildah (the Containerfile uses heredoc "RUN <<EOF" steps that
+      # older buildah versions can't parse). It's launched via Docker, which is
+      # preinstalled on the runner. The container logs into GHCR, pushes every
+      # tag, and exports the image as an OCI archive (for the SBOM step) plus
+      # the pushed digest (for signing) into the workspace.
+      - name: Build and push image
+        id: build
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          PRIMARY: ${{ steps.tags.outputs.primary }}
+          ALL_TAGS: ${{ steps.tags.outputs.tags }}
+          REVISION: ${{ github.sha }}
+          VERSION: ${{ steps.tags.outputs.version }}
+        run: |
+          docker run --rm --privileged \
+            -e REGISTRY="$REGISTRY" \
+            -e REGISTRY_USER \
+            -e REGISTRY_PASSWORD \
+            -e PRIMARY \
+            -e ALL_TAGS \
+            -e REVISION \
+            -e VERSION \
+            -v "$GITHUB_WORKSPACE":/work -w /work \
+            quay.io/buildah/stable:latest \
+            bash -euxo pipefail -c '
+              echo "$REGISTRY_PASSWORD" | buildah login -u "$REGISTRY_USER" --password-stdin "$REGISTRY"
+              buildah bud --format oci \
+                --label org.opencontainers.image.created="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --label org.opencontainers.image.revision="$REVISION" \
+                --label org.opencontainers.image.version="$VERSION" \
+                -t "$PRIMARY" -f Containerfile .
+              read -ra tags <<< "$ALL_TAGS"
+              for t in "${tags[@]:1}"; do
+                buildah tag "$PRIMARY" "$t"
+              done
+              buildah push --digestfile /work/digest.txt "$PRIMARY"
+              for t in "${tags[@]:1}"; do
+                buildah push "$t"
+              done
+              buildah push "$PRIMARY" oci-archive:/work/image.tar
+            '
+          echo "digest=$(cat "$GITHUB_WORKSPACE/digest.txt")" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SBOM
+        run: syft oci-archive:image.tar -o spdx-json=sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.spdx.json
+
+      # Detect repo visibility at runtime. Signing and the SBOM/provenance
+      # attestations below only run once the repo is public, so they turn on
+      # automatically when you flip visibility — on any trigger, including
+      # scheduled runs (where github.event.repository.private is empty). While
+      # private, the build still publishes the image and keeps the SBOM as a
+      # workflow artifact (above).
+      - name: Check repository visibility
+        id: vis
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)
+          echo "Repository is $visibility."
+          [[ "$visibility" == "public" ]] && public=true || public=false
+          echo "public=$public" >> "$GITHUB_OUTPUT"
+
+      # Keyless signature, attached as an OCI 1.1 referrer instead of a
+      # "sha256-….sig" tag (referrers mode is still experimental in cosign,
+      # hence COSIGN_EXPERIMENTAL). Verify with `cosign verify`.
+      - name: Sign image (keyless)
+        if: ${{ steps.vis.outputs.public == 'true' }}
+        env:
+          DOCKER_CONFIG: ${{ github.workspace }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cp "$AUTH_FILE" "$DOCKER_CONFIG/config.json"
+          cosign sign --yes \
+            --registry-referrers-mode oci-1-1 \
+            "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"
+
+      # SBOM attestation (what's inside the image), via GitHub's action so it
+      # lands as a clean OCI 1.1 referrer and in the repo's Attestations UI.
+      # Verify with `gh attestation verify`.
+      - name: Attest SBOM
+        if: ${{ steps.vis.outputs.public == 'true' }}
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+
+      # Signed SLSA build provenance: attests *how* the image was built (this
+      # workflow, commit, runner). Verify with `gh attestation verify`.
+      - name: Attest build provenance
+        if: ${{ steps.vis.outputs.public == 'true' }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

@@ -1,0 +1,114 @@
+#!/bin/sh
+# letswifi-gen-crl — write a CRL to /var/www/letswifi-crl/ca.crl (served at /crl/ca.crl).
+# Run by entrypoint.sh on start and by letswifi-crl.timer every 6h.
+# Arg: a realm name; none = all realms in /etc/letswifi/realms/. SQLite only.
+set -e
+
+DB_FILE="/var/lib/letswifi/letswifi.sqlite"
+OUT_DIR="/var/www/letswifi-crl"
+CRL_DAYS=7
+
+_gen_crl() {
+    _realm="$1"
+    _ca_cn="CN=${_realm} CA"
+    _ca_file="/etc/letswifi/certs/${_ca_cn}.pem"
+
+    if [ ! -f "$_ca_file" ]; then
+        echo "letswifi-gen-crl: signing CA not found for realm ${_realm}, skipping" >&2
+        return 0
+    fi
+
+    if [ ! -f "$DB_FILE" ]; then
+        echo "letswifi-gen-crl: database not found at ${DB_FILE}" >&2
+        exit 1
+    fi
+
+    _work="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '${_work}'" EXIT INT TERM
+
+    # Split the combined cert+key PEM into separate files.
+    openssl x509 -in "$_ca_file" -out "${_work}/ca.crt" 2>/dev/null
+    openssl pkey -in "$_ca_file" -out "${_work}/ca.key" 2>/dev/null
+
+    # Build OpenSSL index.txt from revoked rows in the DB.
+    # Format: R <expiry YYMMDDHHMMSSZ> <revocation YYMMDDHHMMSSZ> <serial HEX> unknown <subject DN>
+    # The CA subject name may contain apostrophes; double them for SQLite literal escaping.
+    _realm_esc="$(printf '%s' "$_realm"  | sed "s/'/''/g")"
+    _ca_esc="$(printf '%s'    "$_ca_cn" | sed "s/'/''/g")"
+
+    sqlite3 "$DB_FILE" \
+        "SELECT serial, sub, revoked, expires
+           FROM realm_signing_log
+          WHERE realm='${_realm_esc}'
+            AND ca_sub='${_ca_esc}'
+            AND revoked IS NOT NULL" \
+    | while IFS='|' read -r _serial _sub _revoked _expires; do
+        # SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS[.fff]" or ISO 8601.
+        # OpenSSL wants YYMMDDHHMMSSZ.
+        _rev_fmt="$(date -d "$_revoked"  +"%y%m%d%H%M%SZ" 2>/dev/null || printf '%s' "$_revoked")"
+        _exp_fmt="$(date -d "$_expires"  +"%y%m%d%H%M%SZ" 2>/dev/null || printf '%s' "$_expires")"
+        # Serial as zero-padded hex (even number of nibbles).
+        _serial_hex="$(printf '%x' "$_serial")"
+        [ $(( ${#_serial_hex} % 2 )) -ne 0 ] && _serial_hex="0${_serial_hex}"
+        printf 'R\t%s\t%s\t%s\tunknown\t%s\n' \
+            "$_exp_fmt" "$_rev_fmt" "$_serial_hex" "$_sub"
+    done > "${_work}/index.txt"
+
+    # crlnumber tracks the CRL sequence number; start at 1 if not persisted.
+    _crlnum_file="${OUT_DIR}/.crlnumber.${_realm}"
+    if [ -f "$_crlnum_file" ]; then
+        cp "$_crlnum_file" "${_work}/crlnumber"
+    else
+        printf '01\n' > "${_work}/crlnumber"
+    fi
+
+    cat > "${_work}/openssl.cnf" <<EOF
+[ca]
+default_ca = CA_default
+
+[CA_default]
+certificate      = ${_work}/ca.crt
+private_key      = ${_work}/ca.key
+database         = ${_work}/index.txt
+crlnumber        = ${_work}/crlnumber
+default_crl_days = ${CRL_DAYS}
+default_md       = sha384
+unique_subject   = no
+
+[crl_ext]
+authorityKeyIdentifier = keyid:always
+EOF
+
+    mkdir -p "$OUT_DIR"
+    openssl ca -config "${_work}/openssl.cnf" \
+        -gencrl \
+        -out "${_work}/ca.crl" \
+        2>/dev/null
+
+    # Atomic swap so FreeRADIUS never sees a partial file.
+    cp "${_work}/crlnumber" "$_crlnum_file"
+    mv "${_work}/ca.crl" "${OUT_DIR}/ca.crl"
+    chmod 644 "${OUT_DIR}/ca.crl"
+
+    _revoked_count="$(wc -l < "${_work}/index.txt" | tr -d ' ')"
+    echo "letswifi-gen-crl: CRL written for ${_realm} (${_revoked_count} revoked entries, valid ${CRL_DAYS} days)"
+
+    trap - EXIT INT TERM
+    rm -rf "$_work"
+}
+
+if [ $# -ge 1 ]; then
+    _gen_crl "$1"
+else
+    _found=0
+    for _realm_file in /etc/letswifi/realms/*.conf.php; do
+        [ -f "$_realm_file" ] || continue
+        _realm="$(basename "$_realm_file" .conf.php)"
+        _gen_crl "$_realm"
+        _found=$(( _found + 1 ))
+    done
+    if [ "$_found" -eq 0 ]; then
+        echo "letswifi-gen-crl: no realm configs found in /etc/letswifi/realms/ — nothing to do"
+    fi
+fi

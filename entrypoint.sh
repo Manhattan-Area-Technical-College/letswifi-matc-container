@@ -1,0 +1,603 @@
+#!/bin/sh
+set -e
+
+APP=/usr/local/share/letswifi-portal
+SSP=/usr/local/share/simplesamlphp
+
+CERT=/etc/pki/tls/certs/letswifi.crt
+KEY=/etc/pki/tls/private/letswifi.key
+CA=/etc/pki/tls/certs/ca.crt
+SSL_CONF=/etc/httpd/conf.d/letswifi-ssl.conf
+
+# Escape characters that are special in a sed replacement string (delimiter @).
+sed_escape() { printf '%s' "$1" | sed 's/[\\&@]/\\&/g'; }
+
+# Escape characters that are special inside a PHP single-quoted string.
+php_escape() { printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g"; }
+
+# Fail fast on the one env var httpd needs at every start (not just first run).
+: "${LETSWIFI_FQDN:?LETSWIFI_FQDN is required (the public hostname, e.g. wifi.example.edu)}"
+
+# ── System crypto policy ──────────────────────────────────────────────────────
+# Optional CRYPTO_POLICY=DEFAULT|FUTURE|NEXT|FIPS (FIPS also needs fips=1 on the
+# host kernel — this sets the algorithm policy only). See install.md.
+if [ -n "${CRYPTO_POLICY:-}" ]; then
+    case "$CRYPTO_POLICY" in
+        DEFAULT|FUTURE|NEXT|FIPS)
+            echo "letswifi: setting system crypto policy to ${CRYPTO_POLICY}"
+            update-crypto-policies --set "$CRYPTO_POLICY"
+            ;;
+        LEGACY)
+            echo "letswifi: WARNING: LEGACY crypto policy enables weak ciphers and is not recommended." >&2
+            echo "letswifi: WARNING: Use DEFAULT or FUTURE unless you have very old clients that require it." >&2
+            update-crypto-policies --set LEGACY
+            ;;
+        *)
+            echo "letswifi: ERROR: unknown CRYPTO_POLICY value '${CRYPTO_POLICY}'." >&2
+            echo "letswifi:        valid values: DEFAULT, FUTURE, NEXT, FIPS" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+# ── CRL toggle ───────────────────────────────────────────────────────────────
+# LETSWIFI_ENABLE_CRL (default true): adds a crlDistributionPoints ext to the CA,
+# generates an initial CRL, and runs the 6-hour refresh timer. The CDP is baked
+# into the CA at first run and is PERMANENT — the toggle only affects CRL
+# generation + timer afterwards. See install.md.
+case "$(printf '%s' "${LETSWIFI_ENABLE_CRL:-true}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on)  ENABLE_CRL=1 ;;
+    0|false|no|off) ENABLE_CRL=0 ;;
+    *)
+        echo "letswifi: ERROR: LETSWIFI_ENABLE_CRL must be true or false (got '${LETSWIFI_ENABLE_CRL}')." >&2
+        exit 1
+        ;;
+esac
+
+# Align the (image-enabled) timer with the toggle. systemd is not up yet — we run
+# before /sbin/init — so enable/disable just edits the timers.target.wants symlink.
+if [ "$ENABLE_CRL" -eq 1 ]; then
+    systemctl enable letswifi-crl.timer >/dev/null 2>&1 || true
+else
+    systemctl disable letswifi-crl.timer >/dev/null 2>&1 || true
+    echo "letswifi: CRL publishing disabled (LETSWIFI_ENABLE_CRL=${LETSWIFI_ENABLE_CRL:-true}) — refresh timer off"
+fi
+
+# ── letswifi config (first run only) ─────────────────────────────────────────
+if [ ! -f /etc/letswifi/letswifi.conf.php ]; then
+    echo "letswifi: first run — initialising letswifi config"
+    cp -a "$APP"/config-dist/. /etc/letswifi/
+
+    #Not documented anywhere fails without.
+case "${LETSWIFI_NETWORK_NAME:-eduroam}" in
+    govroam) cp /etc/letswifi/clients-govroam.conf.php /etc/letswifi/clients.conf.php ;;
+    *)       cp /etc/letswifi/clients-eduroam.conf.php /etc/letswifi/clients.conf.php ;;
+esac
+
+    DSN="sqlite:/var/lib/letswifi/letswifi.sqlite"
+    sed -e "s@^\(\s*'dsn'\).*\$@\1 => '$(sed_escape "${DSN}")',@" \
+        -e "s@^\(\s*'username'\).*\$@\1 => null,@" \
+        -e "s@^\(\s*'password'\).*\$@\1 => null,@" \
+        /etc/letswifi/database.conf.dist-sqlite.php > /etc/letswifi/database.conf.php
+
+    # Provider block lives in its own provider.conf.php (generated below), not inline.
+
+    head -c32 /dev/random | base64 | tr -d = > /etc/letswifi/oauthsecret.txt
+
+    rm -f /etc/letswifi/*.dist* /etc/letswifi/*.dev* /etc/letswifi/README.md
+    rm -f /etc/letswifi/realms/*.conf.php /etc/letswifi/certs/*.pem
+    chgrp -R apache /etc/letswifi
+    chmod o-rwx /etc/letswifi/*
+    echo "letswifi: letswifi config initialised"
+fi
+
+# ── Provider config (first run / regenerable) ────────────────────────────────
+# Generated from env into provider.conf.php (referenced via 'provider#inc'),
+# replacing upstream's inline example provider. Re-apply: delete it and restart.
+if [ -n "${LETSWIFI_REALM:-}" ] && [ ! -f /etc/letswifi/provider.conf.php ]; then
+    echo "letswifi: writing provider config for realm ${LETSWIFI_REALM}"
+
+    # Display name: explicit override → product name → realm display name → realm.
+    _provider_display="$(php_escape "${LETSWIFI_PROVIDER_DISPLAY_NAME:-${LETSWIFI_PRODUCT_NAME:-${LETSWIFI_REALM_DISPLAY_NAME:-$LETSWIFI_REALM}}}")"
+    _provider_desc="$(php_escape "Wi-Fi enrollment for ${LETSWIFI_REALM}")"
+    _provider_realm="$(php_escape "$LETSWIFI_REALM")"
+
+    # Contact: reuse the realm contact; omit (null) when unset.
+    _contact_php="null"
+    [ -n "${LETSWIFI_REALM_CONTACT:-}" ] && _contact_php="'$(php_escape "$LETSWIFI_REALM_CONTACT")'"
+
+    # Admins: comma-separated user IDs / affiliation values, matched at login.
+    _admins_php=""
+    if [ -n "${LETSWIFI_ADMIN_USERS:-}" ]; then
+        _old_ifs="$IFS"; IFS=','
+        for _admin in $LETSWIFI_ADMIN_USERS; do
+            IFS="$_old_ifs"
+            _admin="$(printf '%s' "$_admin" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$_admin" ] && { IFS=','; continue; }
+            _escaped="$(php_escape "$_admin")"
+            if [ -z "$_admins_php" ]; then
+                _admins_php="'${_escaped}'"
+            else
+                _admins_php="${_admins_php}, '${_escaped}'"
+            fi
+            IFS=','
+        done
+        IFS="$_old_ifs"
+    fi
+
+    # User identity attribute embedded in each issued device cert. null = SSP NameID.
+    _uid_php="null"
+    [ -n "${LETSWIFI_USER_ID_ATTRIBUTE:-}" ] && _uid_php="'$(php_escape "$LETSWIFI_USER_ID_ATTRIBUTE")'"
+
+    # Affiliation attribute carrying the user's affiliations (realm + admin scope).
+    _affiliation="$(php_escape "${LETSWIFI_AFFILIATION_ATTRIBUTE:-eduPersonAffiliation}")"
+
+    # SAML IdP pin: sets samlIdp + idpList (a single IdP also skips the SSP picker).
+    _samlidp_php="null"
+    _idplist_php=""
+    if [ -n "${LETSWIFI_SAML_IDP_ENTITYID:-}" ]; then
+        _idp_escaped="$(php_escape "$LETSWIFI_SAML_IDP_ENTITYID")"
+        _samlidp_php="'${_idp_escaped}'"
+        _idplist_php="'${_idp_escaped}'"
+    fi
+
+    # Grant token validity in days (numeric). Omitted = upstream default (6 months).
+    _grant_line=""
+    if [ -n "${LETSWIFI_GRANT_TOKEN_VALIDITY:-}" ]; then
+        case "$LETSWIFI_GRANT_TOKEN_VALIDITY" in
+            ''|*[!0-9]*)
+                echo "letswifi: ERROR: LETSWIFI_GRANT_TOKEN_VALIDITY must be a whole number of days." >&2
+                exit 1
+                ;;
+        esac
+        _grant_line="            'longLivedGrantTokenValidity' => ${LETSWIFI_GRANT_TOKEN_VALIDITY},"
+    fi
+
+    {
+        cat <<PHPEOF
+<?php return [
+    '_default' => [
+        'display_name' => ['en-GB' => '${_provider_display}'],
+        'description'  => ['en-GB' => '${_provider_desc}'],
+        'realm'        => ['' => ['${_provider_realm}']],
+        'contact'      => ${_contact_php},
+        'admins'       => [${_admins_php}],
+        'auth' => [
+            'service' => 'SimpleSamlAuth',
+            'param' => [
+                'autoloadInclude'      => '/usr/local/share/simplesamlphp/lib/_autoload.php',
+                'authSource'           => 'default-sp',
+                'userIdAttribute'      => ${_uid_php},
+                'affiliationAttribute' => '${_affiliation}',
+                'samlIdp'              => ${_samlidp_php},
+                'idpList'              => [${_idplist_php}],
+                'verifyAuthenticatingAuthority' => true,
+            ],
+PHPEOF
+        [ -n "$_grant_line" ] && printf '%s\n' "$_grant_line"
+        cat <<'PHPEOF'
+        ],
+        'location' => [],
+        'logo'     => null,
+
+        // Sibling config files already provisioned in /etc/letswifi by first run.
+        'pdo#inc'          => 'database.conf.php',
+        'clients#inc'      => 'clients.conf.php',
+        'oauthsecret#file' => 'oauthsecret.txt',
+    ],
+];
+PHPEOF
+    } > /etc/letswifi/provider.conf.php
+
+    # Repoint letswifi.conf.php from its inline 'provider' block to 'provider#inc'
+    # (inline takes priority, so the block must go). Idempotent.
+    if ! grep -q "'provider#inc'" /etc/letswifi/letswifi.conf.php; then
+        awk '
+            skip && /^\t\][,]?$/ { skip = 0; next }
+            skip { next }
+            /^\t'\''provider'\'' => \[$/ {
+                print "\t'\''provider#inc'\'' => '\''provider.conf.php'\'',"
+                skip = 1
+                next
+            }
+            { print }
+        ' /etc/letswifi/letswifi.conf.php > /tmp/lw-conf.tmp \
+            && mv /tmp/lw-conf.tmp /etc/letswifi/letswifi.conf.php
+        chgrp apache /etc/letswifi/letswifi.conf.php
+        chmod o-rwx /etc/letswifi/letswifi.conf.php
+    fi
+
+    chgrp apache /etc/letswifi/provider.conf.php
+    chmod o-rwx /etc/letswifi/provider.conf.php
+    echo "letswifi: provider config written (provider#inc → provider.conf.php)"
+fi
+
+# ── SimpleSAMLphp config (first run only) ────────────────────────────────────
+if [ ! -f /etc/simplesamlphp/config.php ]; then
+    echo "letswifi: first run — initialising SimpleSAMLphp config"
+    cp -a "$SSP"/config-dist/. /etc/simplesamlphp/
+    cp -n /etc/simplesamlphp/config.php.dist /etc/simplesamlphp/config.php
+
+    SALT="${SSP_SECRET_SALT:?SSP_SECRET_SALT is required}"
+    ADMIN="${SSP_ADMIN_PASSWORD:?SSP_ADMIN_PASSWORD is required}"
+
+    sed -i \
+        -e "s@'secretsalt' => 'defaultsecretsalt'@'secretsalt' => '$(sed_escape "${SALT}")'@" \
+        -e "s@'auth.adminpassword' => '123'@'auth.adminpassword' => '$(sed_escape "${ADMIN}")'@" \
+        -e "s@//'datadir' => '/var/data/'@'datadir' => '/var/lib/simplesamlphp/data/'@" \
+        -e "s@'metadatadir' => 'metadata'@'metadatadir' => 'config/metadata'@" \
+        -e "s@'baseurlpath' => 'simplesaml/'@'baseurlpath' => 'https://${LETSWIFI_FQDN}/simplesaml/'@" \
+        /etc/simplesamlphp/config.php
+
+    mkdir -p /etc/simplesamlphp/metadata
+
+    # metarefresh: pull IdP metadata daily from your federation / IdP
+    if [ -n "$SSP_IDP_METADATA_URL" ]; then
+        cat > /etc/simplesamlphp/module_metarefresh.php <<EOF
+<?php
+\$config = ['sets' => [[
+    'cron'        => ['daily'],
+    'sources'     => [['src' => '${SSP_IDP_METADATA_URL}']],
+    'expireAfter' => 604800,
+    'outputDir'   => 'config/metadata/',
+    'outputFormat'=> 'flatfile',
+]]];
+EOF
+        # metarefresh runs as a cron hook: both the cron and metarefresh modules
+        # must be enabled AND module_cron.php present, or nothing refreshes.
+        echo "\$config['module.enable']['cron'] = true;" >> /etc/simplesamlphp/config.php
+        echo "\$config['module.enable']['metarefresh'] = true;" >> /etc/simplesamlphp/config.php
+        cat > /etc/simplesamlphp/module_cron.php <<EOF
+<?php
+\$config = [
+    'key'          => '$(head -c32 /dev/random | base64 | tr -d =)',
+    'allowed_tags' => ['daily', 'hourly', 'frequent'],
+    'sendemail'    => false,
+];
+EOF
+        echo "0 4 * * * apache php $SSP/modules/cron/bin/cron.php -t daily >/dev/null" \
+            > /etc/cron.d/simplesamlphp
+        echo "letswifi: IdP metadata refresh configured for ${SSP_IDP_METADATA_URL}"
+    fi
+
+    chown -R apache:apache /etc/simplesamlphp/metadata
+    echo "letswifi: SimpleSAMLphp config initialised"
+fi
+
+# ── SimpleSAMLphp SP authsource (first run / regenerable) ────────────────────
+# Seeds the 'default-sp' authsource SSP needs (it ships only a .dist), sets the
+# SP entityID to this deployment, and pins the IdP when LETSWIFI_SAML_IDP_ENTITYID
+# is set. Re-apply: delete authsources.php (a user-provided one is left untouched).
+# GOTCHA: register the SP entityID + its ACS URL at your IdP and feed SSP the IdP
+# metadata (SSP_IDP_METADATA_URL), or login fails. See install.md.
+if [ ! -f /etc/simplesamlphp/authsources.php ] && [ -f /etc/simplesamlphp/authsources.php.dist ]; then
+    echo "letswifi: first run — writing SimpleSAMLphp default-sp authsource"
+    cp /etc/simplesamlphp/authsources.php.dist /etc/simplesamlphp/authsources.php
+    sed -i "s@'entityID' => 'https://myapp.example.org/'@'entityID' => 'https://$(sed_escape "$LETSWIFI_FQDN")'@" \
+        /etc/simplesamlphp/authsources.php
+    if [ -n "${LETSWIFI_SAML_IDP_ENTITYID:-}" ]; then
+        sed -i "s@'idp' => null@'idp' => '$(sed_escape "$LETSWIFI_SAML_IDP_ENTITYID")'@" \
+            /etc/simplesamlphp/authsources.php
+        echo "letswifi: default-sp IdP pinned to ${LETSWIFI_SAML_IDP_ENTITYID}"
+    else
+        echo "letswifi: default-sp IdP left unset — SimpleSAMLphp will show the IdP picker"
+    fi
+    chown apache:apache /etc/simplesamlphp/authsources.php
+    echo "letswifi: SimpleSAMLphp authsource written"
+fi
+
+# ── Database schema (first run only) ─────────────────────────────────────────
+DB=/var/lib/letswifi/letswifi.sqlite
+if [ ! -f "$DB" ]; then
+    echo "letswifi: first run — creating SQLite database"
+    sqlite3 "$DB" < "$APP"/sql/letswifi.sqlite.sql
+    chown apache:apache "$DB"
+    echo "letswifi: database created at ${DB}"
+fi
+
+# ── RADIUS trust CA discovery (runs every start) ─────────────────────────────
+# Copy CA PEM(s) from /etc/letswifi/trust/ into /etc/letswifi/certs/, named by
+# subject DN (the lookup convention letswifi's DictionaryPemDir uses). The realm
+# trust array is only rebuilt when the realm file is regenerated. See install.md.
+_trust_php=""
+_trust_count=0
+if [ -d /etc/letswifi/trust ]; then
+    mkdir -p /etc/letswifi/certs
+    for _trust_pem in /etc/letswifi/trust/*.pem; do
+        [ -f "$_trust_pem" ] || continue
+        # Subject in DictionaryPemDir format: KEY=VALUE, KEY=VALUE (short names).
+        _subj="$(openssl x509 -noout -subject -nameopt oneline -in "$_trust_pem" \
+            | sed 's/^subject= *//' \
+            | sed 's/ = /=/g')"
+        if [ -z "$_subj" ]; then
+            echo "letswifi: ERROR: could not read subject DN from ${_trust_pem}" >&2
+            exit 1
+        fi
+        # Write cert-only — strips any accidental key material in the source file
+        _dest="/etc/letswifi/certs/${_subj}.pem"
+        openssl x509 -in "$_trust_pem" -out "$_dest"
+        chmod 640 "$_dest"
+        chgrp apache "$_dest"
+        _escaped="$(php_escape "$_subj")"
+        if [ -z "$_trust_php" ]; then
+            _trust_php="'${_escaped}'"
+        else
+            _trust_php="${_trust_php}, '${_escaped}'"
+        fi
+        _trust_count=$(( _trust_count + 1 ))
+        echo "letswifi: trust CA registered: ${_subj}"
+    done
+fi
+
+# ── Realm + CA provisioning (first run only) ─────────────────────────────────
+if [ -n "${LETSWIFI_REALM:-}" ]; then
+    mkdir -p /etc/letswifi/realms /etc/letswifi/certs
+
+    CA_CN="CN=${LETSWIFI_REALM} CA"
+    CA_FILE="/etc/letswifi/certs/${CA_CN}.pem"
+
+    # Signing CA: P-384, pathlen:0 (no sub-CAs), validity LETSWIFI_REALM_CA_VALIDITY
+    # years (default 15). See install.md.
+    if [ ! -f "$CA_FILE" ]; then
+        echo "letswifi: first run — generating signing CA for realm ${LETSWIFI_REALM}"
+        CA_DAYS=$(( ${LETSWIFI_REALM_CA_VALIDITY:-15} * 365 ))
+        # CRL distribution point only when enabled (held in $@ so it's omitted
+        # cleanly when off — a CDP with no served CRL breaks revocation checks).
+        set --
+        [ "$ENABLE_CRL" -eq 1 ] && set -- -addext "crlDistributionPoints=URI:https://${LETSWIFI_FQDN}/crl/ca.crl"
+        openssl req -new -x509 \
+            -newkey ec \
+            -pkeyopt ec_paramgen_curve:P-384 \
+            -keyout /tmp/letswifi-ca.key \
+            -out /tmp/letswifi-ca.crt \
+            -days "$CA_DAYS" \
+            -subj "/CN=${LETSWIFI_REALM} CA" \
+            -nodes \
+            -addext "basicConstraints=critical,CA:true,pathlen:0" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -addext "extendedKeyUsage=clientAuth" \
+            -addext "subjectKeyIdentifier=hash" \
+            "$@"
+        cat /tmp/letswifi-ca.crt /tmp/letswifi-ca.key > "$CA_FILE"
+        rm -f /tmp/letswifi-ca.key /tmp/letswifi-ca.crt
+        chmod 640 "$CA_FILE"
+        echo "letswifi: CA generated (P-384, ${CA_DAYS} days)"
+    fi
+
+    # Realm config — derived from env. Re-apply: delete the realm file and restart.
+    REALM_FILE="/etc/letswifi/realms/${LETSWIFI_REALM}.conf.php"
+    if [ ! -f "$REALM_FILE" ]; then
+        if [ "$_trust_count" -eq 0 ]; then
+            echo "letswifi: ERROR: LETSWIFI_REALM is set but no trust CA certs were found." >&2
+            echo "letswifi:        Drop your RADIUS server's CA cert PEM(s) into" >&2
+            echo "letswifi:        /etc/letswifi/trust/ before first start. See install.md." >&2
+            exit 1
+        fi
+        echo "letswifi: first run — writing realm config for ${LETSWIFI_REALM}"
+        _display="$(php_escape "${LETSWIFI_REALM_DISPLAY_NAME:-$LETSWIFI_REALM}")"
+        _validity="${LETSWIFI_REALM_VALIDITY:-365}"
+        _contact="$(php_escape "${LETSWIFI_REALM_CONTACT:-}")"
+        _ca="$(php_escape "$CA_CN")"
+        _contact_php="null"
+        [ -n "${LETSWIFI_REALM_CONTACT:-}" ] && _contact_php="'${_contact}'"
+
+        # server_names array from the comma-separated LETSWIFI_RADIUS_CN.
+        _server_names=""
+        _old_ifs="$IFS"; IFS=','
+        for _name in ${LETSWIFI_RADIUS_CN:-radius.$LETSWIFI_REALM}; do
+            IFS="$_old_ifs"
+            _name="$(printf '%s' "$_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$_name" ] && { IFS=','; continue; }
+            _escaped="$(php_escape "$_name")"
+            if [ -z "$_server_names" ]; then
+                _server_names="'${_escaped}'"
+            else
+                _server_names="${_server_names}, '${_escaped}'"
+            fi
+            IFS=','
+        done
+        IFS="$_old_ifs"
+
+        if [ -z "$_server_names" ]; then
+            echo "letswifi: ERROR: LETSWIFI_RADIUS_CN is empty — cannot write realm config." >&2
+            exit 1
+        fi
+
+        cat > "$REALM_FILE" <<PHPEOF
+<?php return [
+    'display_name'  => ['en-GB' => '${_display}'],
+    'description'   => null,
+    'server_names'  => [${_server_names}],
+    'validity'      => ${_validity},
+    'networks'      => ['eduroam'],
+    'contact'       => ${_contact_php},
+    'signer'        => '${_ca}',
+    'trust'         => [${_trust_php}],
+];
+PHPEOF
+        echo "letswifi: realm config written"
+    fi
+
+    chgrp -R apache /etc/letswifi/realms /etc/letswifi/certs
+    chmod o-rwx /etc/letswifi/realms/* /etc/letswifi/certs/*
+
+    # Generate an initial CRL so /crl/ca.crl is available immediately after start.
+    # The timer (every 6 hours) keeps it fresh; this covers the restart gap.
+    if [ "$ENABLE_CRL" -eq 1 ]; then
+        mkdir -p /var/www/letswifi-crl
+        chown apache:apache /var/www/letswifi-crl
+        su -s /bin/sh apache -c "/usr/local/bin/letswifi-gen-crl '${LETSWIFI_REALM}'" \
+            || echo "letswifi: WARNING: initial CRL generation failed — the systemd timer will retry in 6 hours" >&2
+    fi
+fi
+
+# ── Branding config (first run only) ─────────────────────────────────────────
+if [ ! -f /etc/letswifi/branding.conf.php ] && [ -n "${LETSWIFI_PRODUCT_NAME:-}" ]; then
+    echo "letswifi: first run — writing branding config"
+
+    SHORTNAME="${LETSWIFI_PRODUCT_SHORTNAME:-$(printf '%s' "$LETSWIFI_PRODUCT_NAME" \
+        | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')}"
+    NETWORK="${LETSWIFI_NETWORK_NAME:-eduroam}"
+
+    # Detect CSS and favicon from the branding volume directory
+    _css='' _favicon=''
+    if [ -d /etc/letswifi/branding ]; then
+        for _f in /etc/letswifi/branding/*.css;              do [ -f "$_f" ] && _css=$(basename "$_f")     && break; done
+        for _f in /etc/letswifi/branding/*.ico;              do [ -f "$_f" ] && _favicon=$(basename "$_f") && break; done
+        if [ -z "$_favicon" ]; then
+            for _f in /etc/letswifi/branding/*.svg /etc/letswifi/branding/*.png; do
+                [ -f "$_f" ] && _favicon=$(basename "$_f") && break
+            done
+        fi
+    fi
+
+    {
+        cat <<PHPEOF
+<?php
+return [
+    'product_name'      => '$(php_escape "$LETSWIFI_PRODUCT_NAME")',
+    'product_shortname' => '$(php_escape "$SHORTNAME")',
+    'network_name'      => '$(php_escape "$NETWORK")',
+PHPEOF
+        [ -n "$_css" ]     && printf "    'css_file'     => '%s',\n" "$(php_escape "$_css")"
+        [ -n "$_favicon" ] && printf "    'favicon_file' => '%s',\n" "$(php_escape "$_favicon")"
+        cat <<'PHPEOF'
+
+    'platforms' => [
+        'android'    => ['name' => 'Android',  'match' => 'Android [1-9][0-9]+;',                       'apps' => ['play-store', 'f-droid']],
+        'chromebook' => ['name' => 'ChromeOS', 'match' => 'CrOS',                                       'apps' => ['play-store'],           'profiles' => ['google-onc']],
+        'ios'        => ['name' => 'iOS',       'match' => '(iPad|iPhone|iPod);.*OS [1-9][0-9]+_[0-9]', 'apps' => ['app-store'],            'profiles' => ['apple-mobileconfig']],
+        'linux'      => ['name' => 'Linux',     'match' => '(Linux;? *[^A]|X11;? *Linux)',               'apps' => ['flathub', 'github-linux']],
+        'macos'      => ['name' => 'macOS',     'match' => 'Mac OS X [1-9][0-9]+[._][0-9]',                                                  'profiles' => ['apple-mobileconfig']],
+        'windows'    => ['name' => 'Windows',   'match' => 'Windows NT [0-9]',                           'apps' => ['winnt-amd64', 'winnt-arm64']],
+    ],
+
+    'apps' => [
+        'app-store'    => ['name' => 'App Store',      'href' => 'https://apps.apple.com/app/geteduroam/id1504076137',                   'type' => 'store'],
+        'f-droid'      => ['name' => 'F-Droid',        'href' => 'https://f-droid.org/en/packages/app.eduroam.geteduroam/',              'type' => 'store'],
+        'flathub'      => ['name' => 'Flathub',        'href' => 'https://flathub.org/apps/app.eduroam.geteduroam/',                     'type' => 'store'],
+        'github-linux' => ['name' => 'GitHub Release', 'href' => 'https://github.com/geteduroam/linux-app/releases/',                   'type' => 'link'],
+        'play-store'   => ['name' => 'Play Store',     'href' => 'https://play.google.com/store/apps/details?id=app.eduroam.geteduroam', 'type' => 'store'],
+        'winnt-amd64'  => ['name' => 'x64 EXE',        'href' => 'https://dl.eduroam.app/windows/amd64/geteduroam.exe',                  'type' => 'download'],
+        'winnt-arm64'  => ['name' => 'arm64 EXE',      'href' => 'https://dl.eduroam.app/windows/arm64/geteduroam.exe',                  'type' => 'download'],
+    ],
+
+    'profiles' => [
+        'google-onc'         => ['name' => 'ONC Profile'],
+        'apple-mobileconfig' => ['name' => 'Apple Configuration Profile'],
+    ],
+];
+PHPEOF
+    } > /etc/letswifi/branding.conf.php
+
+    # Enable branding in letswifi.conf.php (the line is commented out by default)
+    sed -i "s@// 'branding#inc' => 'branding-eduroam.conf.php',@'branding#inc' => 'branding.conf.php',@" \
+        /etc/letswifi/letswifi.conf.php
+
+    # Persist shortname for asset symlinking on subsequent starts
+    printf '%s' "$SHORTNAME" > /etc/letswifi/branding.shortname
+
+    echo "letswifi: branding config written (product: ${LETSWIFI_PRODUCT_NAME}, shortname: ${SHORTNAME})"
+fi
+
+# ── Branding assets (re-evaluated every start — update files and restart) ─────
+if [ -f /etc/letswifi/branding.shortname ] && [ -d /etc/letswifi/branding ]; then
+    _shortname=$(cat /etc/letswifi/branding.shortname)
+    ln -sfn /etc/letswifi/branding "$APP/htdocs/assets/branding/${_shortname}"
+    echo "letswifi: branding assets linked → htdocs/assets/branding/${_shortname}/"
+fi
+
+# ── TLS / mTLS (re-evaluated every start — swap certs without rebuilding) ────
+# HTTPS auto-enables with cert ($CERT) + key ($KEY); mTLS also with a CA ($CA).
+# Set PublishPort 8443:443 in letswifi.container when using TLS. See install.md.
+if [ -f "$CERT" ] || [ -f "$KEY" ]; then
+    # Partial configuration is always an error
+    if [ ! -f "$CERT" ]; then
+        echo "letswifi: ERROR: TLS key found at ${KEY} but certificate is missing." >&2
+        echo "letswifi:        Place the server certificate at: ${CERT}" >&2
+        exit 1
+    fi
+    if [ ! -f "$KEY" ]; then
+        echo "letswifi: ERROR: TLS certificate found at ${CERT} but private key is missing." >&2
+        echo "letswifi:        Place the private key at: ${KEY}" >&2
+        exit 1
+    fi
+
+    if [ -f "$CA" ]; then
+        echo "letswifi: CA cert found — HTTPS with mTLS enabled on port 443"
+        echo "letswifi:   server cert: ${CERT}"
+        echo "letswifi:   CA cert:     ${CA} (client certificates required)"
+        MTLS_DIRECTIVES="    # mTLS: require a client cert and export it to PHP
+    # (\$_SERVER['SSL_CLIENT_CERT']) for letswifi's cert renewal flow.
+    SSLVerifyClient      require
+    SSLCACertificateFile ${CA}
+    SSLOptions           +ExportCertData"
+    else
+        echo "letswifi: TLS cert found — HTTPS enabled on port 443 (no mTLS)"
+        echo "letswifi:   server cert: ${CERT}"
+        echo "letswifi:   to enable mTLS, add a CA cert at: ${CA}"
+        MTLS_DIRECTIVES=""
+    fi
+
+    # Regenerate the SSL vhost on every start so cert/mTLS changes take effect.
+    cat > "$SSL_CONF" <<EOF
+# Generated by entrypoint.sh on every container start. Do not edit here.
+# To reconfigure TLS, change the cert files and restart the container.
+<VirtualHost *:443>
+    ServerName      ${LETSWIFI_FQDN}
+    DocumentRoot    /usr/local/share/letswifi-portal/htdocs
+    Alias /simplesaml /usr/local/share/simplesamlphp/public
+    Alias /crl        /var/www/letswifi-crl
+
+    SetEnv SIMPLESAMLPHP_CONFIG_DIR /etc/simplesamlphp
+    SetEnv LETSWIFI_CONFIG_DIR      /etc/letswifi
+
+    SSLEngine             on
+    SSLCertificateFile    ${CERT}
+    SSLCertificateKeyFile ${KEY}
+
+    # Defer to the system crypto policy (CRYPTO_POLICY / update-crypto-policies).
+    SSLProtocol           all -SSLv3
+    SSLCipherSuite        PROFILE=SYSTEM
+    SSLHonorCipherOrder   off
+    # Disable session tickets (not covered by the system policy) for forward secrecy.
+    SSLSessionTickets     off
+
+${MTLS_DIRECTIVES}
+
+    # 2-year HSTS — only set this once you're certain HTTPS is permanent.
+    Header always set Strict-Transport-Security "max-age=63072000; includeSubDomains"
+    Header always set Content-Security-Policy "default-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
+    Header always set Referrer-Policy         "no-referrer"
+    Header always set X-Frame-Options         "DENY"
+    Header always set X-Content-Type-Options  "nosniff"
+
+    <FilesMatch \.php\$>
+        SetHandler "proxy:unix:/run/php-fpm/www.sock|fcgi://localhost"
+    </FilesMatch>
+
+    <Directory /usr/local/share/letswifi-portal/htdocs>
+        Require all granted
+    </Directory>
+    <Directory /usr/local/share/simplesamlphp/public>
+        Require all granted
+    </Directory>
+    <Directory /var/www/letswifi-crl>
+        Require all granted
+        Options -Indexes
+    </Directory>
+</VirtualHost>
+EOF
+
+else
+    # No certs — remove any stale SSL conf from a previous run.
+    rm -f "$SSL_CONF"
+    echo "letswifi: no TLS cert found — running HTTP only on port 80"
+    echo "letswifi: to enable HTTPS, provide:"
+    echo "letswifi:   server cert:  ${CERT}"
+    echo "letswifi:   server key:   ${KEY}"
+    echo "letswifi:   CA cert:      ${CA}  (optional, enables mTLS)"
+    echo "letswifi: also change PublishPort to 8443:443 in letswifi.container"
+fi
+
+exec /sbin/init

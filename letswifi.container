@@ -1,0 +1,37 @@
+[Unit]
+Description=LetsWifi Eduroam Portal
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/letswifi:latest
+
+# ── Networking ───────────────────────────────────────────────────────────────
+# Default: plain HTTP, TLS terminates at your reverse proxy. To terminate TLS in
+# the container instead, swap to 8443:443 and add the certs. See install.md.
+PublishPort=8080:80
+# PublishPort=8443:443
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# podman secret create <name> - <<< "value"  — injected as env vars.
+Secret=ssp_secret_salt,type=env,target=SSP_SECRET_SALT
+Secret=ssp_admin_password,type=env,target=SSP_ADMIN_PASSWORD
+
+EnvironmentFile=/etc/sysconfig/letswifi
+
+# ── Persistent storage ───────────────────────────────────────────────────────
+Volume=letswifi-data:/var/lib/letswifi:Z
+Volume=letswifi-config:/etc/letswifi:Z
+Volume=letswifi-ssp:/etc/simplesamlphp:Z
+
+PodmanArgs=--systemd=always
+
+StopTimeout=30
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=90
+
+[Install]
+WantedBy=default.target
