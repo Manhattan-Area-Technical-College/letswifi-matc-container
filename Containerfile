@@ -1,4 +1,4 @@
-#Manhattan Tech's Container build of LetsWifi for our Eduroam deployment. 
+#Manhattan Tech's Container build of LetsWifi for our eduroam deployment. 
 #Builds are multistage
 #Stage 1 Build
 FROM registry.access.redhat.com/ubi10/ubi:10.0 AS builder
