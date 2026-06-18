@@ -15,7 +15,10 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  AUTH_FILE: ${{ github.workspace }}/.docker-config.json
+  # Docker config dir for cosign and buildah (both honor $DOCKER_CONFIG).
+  # NOTE: the attest actions push via @sigstore/oci, which ignores DOCKER_CONFIG
+  # and only reads ~/.docker/config.json — so the credentials step writes both.
+  DOCKER_CONFIG: ${{ github.workspace }}/.docker
 
 jobs:
   build:
@@ -58,7 +61,11 @@ jobs:
       - name: Write registry credentials
         run: |
           auth=$(printf '%s:%s' "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 -w0)
-          printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$auth" > "$AUTH_FILE"
+          creds=$(printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$auth")
+          # cosign/buildah read $DOCKER_CONFIG; the attest actions (@sigstore/oci)
+          # only read ~/.docker/config.json — write both so all steps authenticate.
+          mkdir -p "$DOCKER_CONFIG";  printf '%s' "$creds" > "$DOCKER_CONFIG/config.json"
+          mkdir -p "$HOME/.docker";   printf '%s' "$creds" > "$HOME/.docker/config.json"
 
       # Tagged pushes (vX.Y.Z) — and scheduled rebuilds of the latest release —
       # publish the stable, version-pinned tags that other people should build
@@ -169,10 +176,8 @@ jobs:
       - name: Sign image (keyless)
         if: ${{ steps.vis.outputs.public == 'true' }}
         env:
-          DOCKER_CONFIG: ${{ github.workspace }}
           COSIGN_EXPERIMENTAL: "1"
         run: |
-          cp "$AUTH_FILE" "$DOCKER_CONFIG/config.json"
           cosign sign --yes \
             --registry-referrers-mode oci-1-1 \
             "${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}"

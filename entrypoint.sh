@@ -381,6 +381,9 @@ if [ -n "${LETSWIFI_REALM:-}" ]; then
         _contact_php="null"
         [ -n "${LETSWIFI_REALM_CONTACT:-}" ] && _contact_php="'${_contact}'"
 
+        _realm_desc="${LETSWIFI_REALM_DESCRIPTION:-Wi-Fi enrollment for ${LETSWIFI_REALM_DISPLAY_NAME:-$LETSWIFI_REALM}}"
+        _realm_desc_php="['en-GB' => '$(php_escape "$_realm_desc")']"
+
         # server_names array from the comma-separated LETSWIFI_RADIUS_CN.
         _server_names=""
         _old_ifs="$IFS"; IFS=','
@@ -406,7 +409,7 @@ if [ -n "${LETSWIFI_REALM:-}" ]; then
         cat > "$REALM_FILE" <<PHPEOF
 <?php return [
     'display_name'  => ['en-GB' => '${_display}'],
-    'description'   => null,
+    'description'   => ${_realm_desc_php},
     'server_names'  => [${_server_names}],
     'validity'      => ${_validity},
     'networks'      => ['eduroam'],
