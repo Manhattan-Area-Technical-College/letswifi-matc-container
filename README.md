@@ -18,6 +18,8 @@ Instead of relying on install scripts that target specific platforms, this proje
 
 This is still in development, we have this deployed on our network but we have not rolled out eduroam to students/staff yet and done a full test. 
 
+Install documentation is a work in progress, though if you know anything about containers you should be able to take this and get going, I have the quadlet files as an example. If anyone wants to build compose and helm examples that would be great for other people to use. 
+
 
 ## Authors and Contributors
 
@@ -25,7 +27,7 @@ This is still in development, we have this deployed on our network but we have n
 
 ## AI Policy
 
-We are still in the early days, but over the last 6 months it has become clear the tools are acceptable if watched carefully. If anyone else contributes they can be used, just review and know what your adding does. I used it to help organize some of the documentation and help with where my PHP skills were weak and especially the crl generation script. Also I have never used Github actions before so it was vital in getting that done quickly, I also tend to let it review all my commits helps me catch my human errors. 
+We are still in the early days, but over the last 6 months it has become clear the tools are acceptable if watched carefully. If anyone else contributes they can be used, just review and know what it is doing and what it added does. I used it to help organize and rewrite some of the documentation for grammer and clarity and help with where my PHP skills were weak and especially the crl generation script, as well as squish the commits from my early testing. Also I have never used Github actions before so it was vital in getting that done quickly, I also tend to let it review all my commits helps me catch my human errors. Also to write commit messages as i tend to just wrote "edited file" otherwise.
 
 ## Licensing
 
