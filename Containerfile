@@ -63,6 +63,11 @@ RUN <<EOF bash
 EOF
 
 COPY httpd-letswifi.conf  /etc/httpd/conf.d/letswifi.conf
+
+# With TLS terminated outside the container, PHP sees SERVER_PORT=80 and the portal/SimpleSAMLphp append ":80" to the URLs
+COPY forwarded-port.php     /usr/local/share/letswifi-portal/forwarded-port.php
+COPY php-forwarded-port.ini /etc/php.d/90-forwarded-port.ini
+
 COPY entrypoint.sh        /usr/local/bin/entrypoint.sh
 COPY letswifi-gen-crl     /usr/local/bin/letswifi-gen-crl
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/letswifi-gen-crl
