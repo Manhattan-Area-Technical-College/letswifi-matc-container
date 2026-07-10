@@ -3,8 +3,8 @@
 #Stage 1 Build
 FROM registry.access.redhat.com/ubi10/ubi:10.0 AS builder
     
-ARG LETSWIFI_VERSION=v2.0.0-beta3
-ARG LETSWIFI_SHA256=b4d3f1f69254867962569170f197b6794838ef9142468ce84ae3910464c81fcc
+ARG LETSWIFI_VERSION=v2.0.0-beta4
+ARG LETSWIFI_SHA256=46972dff011d38b2d4075554031e362383b9ed6b4dc82cc9fc2f1a92b9f84388
 ARG SSP_VERSION=2.5.2
 ARG SSP_SHA256=1394883cc15fb532b9cbac899377caac72163aaab964c0c67a793a69142a8902
 
@@ -15,11 +15,11 @@ WORKDIR /build
 
 RUN <<EOF bash
     set -euxo pipefail
-    curl -sSL "https://github.com/geteduroam/letswifi-portal/archive/refs/tags/${LETSWIFI_VERSION}.tar.gz" -o letswifi.tar.gz
-    echo "${LETSWIFI_SHA256}  letswifi.tar.gz" | sha256sum -c -
+    curl -sSL "https://github.com/geteduroam/letswifi-portal/archive/refs/tags/${LETSWIFI_VERSION}.tar.gz" -o "${LETSWIFI_VERSION}.tar.gz"
+    echo "${LETSWIFI_SHA256} ${LETSWIFI_VERSION}.tar.gz" | sha256sum -c -
     mkdir letswifi-portal
-    tar xz --strip-components=1 -C letswifi-portal -f letswifi.tar.gz
-    rm letswifi.tar.gz
+    tar xz --strip-components=1 -C letswifi-portal -f "${LETSWIFI_VERSION}.tar.gz"
+    rm "${LETSWIFI_VERSION}.tar.gz"
     cd letswifi-portal
     if [[ ! -f composer.lock ]]; then
         echo "ERROR: composer.lock is missing from the tarball." >&2
@@ -73,7 +73,8 @@ COPY letswifi-gen-crl     /usr/local/bin/letswifi-gen-crl
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/letswifi-gen-crl
 
 COPY letswifi-crl.service letswifi-crl.timer /etc/systemd/system/
-RUN systemctl enable letswifi-crl.timer
+COPY letswifi-metarefresh.service letswifi-metarefresh.timer /etc/systemd/system/
+RUN systemctl enable letswifi-crl.timer letswifi-metarefresh.timer
 
 RUN <<EOF bash
     set -euxo pipefail

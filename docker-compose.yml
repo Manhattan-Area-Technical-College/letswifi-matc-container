@@ -1,0 +1,23 @@
+name: letswifi-container
+
+services:
+  letswifi:
+    image: ghcr.io/manhattan-area-technical-college/letswifi-matc-container:latest
+    ports:
+      - "8080:80"
+    volumes:
+      - "letswifi-data:/var/lib/letswifi:Z"
+      - "letswifi-config:/etc/letswifi:Z"
+      - "letswifi-ssp:/etc/simplesamlphp:Z"
+    restart: always
+    env_file: letswifi.env
+    privileged: true
+    stop_signal: SIGRTMIN+3
+    environment:
+      - container=docker
+
+
+volumes:
+  letswifi-data:
+  letswifi-config:
+  letswifi-ssp:

@@ -212,6 +212,50 @@ PHPEOF
     echo "letswifi: provider config written (provider#inc → provider.conf.php)"
 fi
 
+# ── Contact registry (every start) ───────────────────────────────────────────
+# The portal resolves the provider/realm 'contact' values as IDs through the
+# top-level 'contact' dictionary, so the address written above needs a matching
+# entry there or every page 500s. Repoint upstream's inline example block to
+# 'contact#inc' → contact.conf.php (inline takes priority, so the block must
+# go) and merge the configured address in. Entries are never removed: realm
+# files are not regenerated and may still reference an earlier address. Runs
+# every start so already-provisioned volumes pick it up too.
+if [ -n "${LETSWIFI_REALM_CONTACT:-}" ]; then
+    if ! grep -q "'contact#inc'" /etc/letswifi/letswifi.conf.php; then
+        awk '
+            skip && /^\t\][,]?$/ { skip = 0; next }
+            skip { next }
+            /^\t'\''contact'\'' => \[$/ {
+                print "\t'\''contact#inc'\'' => '\''contact.conf.php'\'',"
+                skip = 1
+                next
+            }
+            { print }
+        ' /etc/letswifi/letswifi.conf.php > /tmp/lw-conf.tmp \
+            && mv /tmp/lw-conf.tmp /etc/letswifi/letswifi.conf.php
+        if ! grep -q "'contact#inc'" /etc/letswifi/letswifi.conf.php; then
+            echo "letswifi: ERROR: could not repoint the 'contact' block in letswifi.conf.php," >&2
+            echo "letswifi:        which LETSWIFI_REALM_CONTACT needs to resolve. See install.md." >&2
+            exit 1
+        fi
+        chgrp apache /etc/letswifi/letswifi.conf.php
+        chmod o-rwx /etc/letswifi/letswifi.conf.php
+    fi
+    php -r '
+        $file = "/etc/letswifi/contact.conf.php";
+        $contacts = is_file($file) ? (include $file) : [];
+        if (!is_array($contacts)) { $contacts = []; }
+        $id = $argv[1];
+        if (!array_key_exists($id, $contacts)) {
+            $contacts[$id] = ["mail" => $id];
+            file_put_contents($file, "<?php return " . var_export($contacts, true) . ";\n");
+        }
+    ' "$LETSWIFI_REALM_CONTACT"
+    chgrp apache /etc/letswifi/contact.conf.php
+    chmod o-rwx /etc/letswifi/contact.conf.php
+    echo "letswifi: contact registry ensured (${LETSWIFI_REALM_CONTACT} → contact.conf.php)"
+fi
+
 # ── SimpleSAMLphp config (first run only) ────────────────────────────────────
 if [ ! -f /etc/simplesamlphp/config.php ]; then
     echo "letswifi: first run — initialising SimpleSAMLphp config"
@@ -243,8 +287,12 @@ if [ ! -f /etc/simplesamlphp/config.php ]; then
     'outputFormat'=> 'flatfile',
 ]]];
 EOF
-        # metarefresh runs as a cron hook: both the cron and metarefresh modules
-        # must be enabled AND module_cron.php present, or nothing refreshes.
+        # metarefresh runs via SSP's cron module, triggered by the image's
+        # letswifi-metarefresh.timer (gated on module_metarefresh.php existing —
+        # never written at runtime: a first-run file outside the volumes would
+        # vanish on container recreation and metadata would expire 7 days later).
+        # The cron and metarefresh modules must be enabled AND module_cron.php
+        # present, or the timer's runs silently refresh nothing.
         echo "\$config['module.enable']['cron'] = true;" >> /etc/simplesamlphp/config.php
         echo "\$config['module.enable']['metarefresh'] = true;" >> /etc/simplesamlphp/config.php
         cat > /etc/simplesamlphp/module_cron.php <<EOF
@@ -255,8 +303,6 @@ EOF
     'sendemail'    => false,
 ];
 EOF
-        echo "0 4 * * * apache php $SSP/modules/cron/bin/cron.php -t daily >/dev/null" \
-            > /etc/cron.d/simplesamlphp
         echo "letswifi: IdP metadata refresh configured for ${SSP_IDP_METADATA_URL}"
     fi
 

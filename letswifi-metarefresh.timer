@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh IdP metadata at boot and daily
+
+[Timer]
+# OnBootSec heals metadata that expired while the refresh wasn't running (e.g.
+# downtime longer than metarefresh's expireAfter) and doubles as the initial
+# fetch on first run, instead of leaving login broken until 04:00.
+OnBootSec=1min
+OnCalendar=*-*-* 04:00:00
+AccuracySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

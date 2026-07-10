@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh IdP metadata (SimpleSAMLphp metarefresh)
+# No-op unless the entrypoint configured metarefresh (SSP_IDP_METADATA_URL set).
+ConditionPathExists=/etc/simplesamlphp/module_metarefresh.php
+After=network.target
+
+[Service]
+Type=oneshot
+User=apache
+ExecStart=/usr/bin/php /usr/local/share/simplesamlphp/modules/cron/bin/cron.php -t daily
+StandardOutput=journal
+StandardError=journal
