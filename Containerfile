@@ -1,12 +1,12 @@
 #Manhattan Tech's Container build of LetsWifi for our eduroam deployment. 
 #Builds are multistage
 #Stage 1 Build
-FROM registry.access.redhat.com/ubi10/ubi:10.0 AS builder
+FROM registry.access.redhat.com/ubi10/ubi:10.2 AS builder
     
-ARG LETSWIFI_VERSION=v2.0.0-beta5
-ARG LETSWIFI_SHA256=b6f0d50a991dc4491adf324d0535d409f020d3c109b89fde117755c33e721d26
-ARG SSP_VERSION=2.5.2
-ARG SSP_SHA256=1394883cc15fb532b9cbac899377caac72163aaab964c0c67a793a69142a8902
+ARG LETSWIFI_VERSION=v2.0.0-beta7
+ARG LETSWIFI_SHA256=3cb779e30e3536075d8d4b4482acc9dc074c622399c55f02f1f1612fc7e1141e
+ARG SSP_VERSION=2.5.3.1
+ARG SSP_SHA256=b199ebcba6e30220e7b5df2783ca42f8947dd9bdf046e9e6302fef3d3a438d01
 
 RUN dnf install -y php php-xml php-mbstring tar unzip git && dnf clean all
 COPY --from=docker.io/library/composer:2 /usr/bin/composer /usr/bin/composer
@@ -40,7 +40,7 @@ RUN <<EOF bash
 EOF
 
 #Stage 2 For real this time
-FROM registry.access.redhat.com/ubi10/ubi-init:10.0
+FROM registry.access.redhat.com/ubi10/ubi-init:10.2
 
 RUN <<EOF bash
     set -euxo pipefail
